@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pocket Uninstaller 0.2.0. Python 3.9+, standard library only. MIT license."""
+"""Pocket Uninstaller 3.3. Python 3.9+, standard library only. MIT license."""
 from __future__ import annotations
 
 import argparse
@@ -7,6 +7,7 @@ import concurrent.futures
 import configparser
 import dataclasses
 import datetime
+from decimal import Decimal, InvalidOperation
 import fcntl
 import json
 import os
@@ -22,12 +23,13 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 
-VERSION = "0.2.0"
+VERSION = "3.3"
 TITLE = "Pocket Uninstaller"
 HOME = Path.home().resolve()
 STORE = HOME / ".local/share/pocket-uninstaller"
-ENV = dict(os.environ, LC_ALL="C", LANG="C", NO_COLOR="1",
+ENV = dict(os.environ, LC_ALL="C.UTF-8", LANG="C.UTF-8", NO_COLOR="1",
            HOMEBREW_NO_AUTO_UPDATE="1", HOMEBREW_NO_INSTALL_CLEANUP="1")
 SYSTEM = {"APT", "Pacman", "DNF", "Zypper", "Snap"}
 IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+@:/-]*\Z")
@@ -55,10 +57,362 @@ class App:
     scope: str = "system"
     note: str = ""
     protected: bool = False
+    size_bytes: int | None = None
+    size_kind: str = "unknown"
+    size_note: str = "Installed size unavailable"
 
     @property
     def key(self):
         return self.manager, self.ident, self.scope
+
+
+def parse_size(value, default_unit="B"):
+    """Parse C-locale SI/IEC output, preserving unknown instead of inventing zero."""
+    if value is None:
+        return None
+    # Normalize non-breaking and other unicode spaces
+    value = str(value).replace('\u00a0', ' ').replace('\u2007', ' ').replace('\u202f', ' ')
+    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]*)\s*", value)
+    if not match:
+        return None
+    unit = (match[2] or default_unit).lower()
+    units = {"b": 1, "bytes": 1}
+    for power, prefix in enumerate("kmgtpe", 1):
+        units[prefix + "b"] = 1000 ** power
+        units[prefix + "ib"] = 1024 ** power
+    try:
+        return int(Decimal(match[1]) * units[unit])
+    except (KeyError, InvalidOperation, OverflowError):
+        return None
+
+
+def format_size(value):
+    if value is None:
+        return "Unknown"
+    amount = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"):
+        if amount < 1024 or unit == "EiB":
+            return f"{int(amount)} B" if unit == "B" else f"{amount:.1f} {unit}"
+        amount /= 1024
+
+
+def size_total(apps):
+    entries = list(apps)
+    known = [a.size_bytes for a in entries if a.size_bytes is not None]
+    return sum(known), len(entries) - len(known)
+
+
+def total_label(apps):
+    apps = list(apps)
+    size, missing = size_total(apps)
+    if apps and missing == len(apps):
+        return "Unknown", f"{missing} size(s) unavailable"
+    return format_size(size), f"{missing} unknown, excluded" if missing else "Reported + measured sizes"
+
+
+def sort_apps(apps, order):
+    if order == "largest":
+        return sorted(apps, key=lambda a: (a.size_bytes is None, -(a.size_bytes or 0), a.name.casefold(), a.key))
+    if order == "smallest":
+        return sorted(apps, key=lambda a: (a.size_bytes is None, a.size_bytes or 0, a.name.casefold(), a.key))
+    return sorted(apps, key=lambda a: (a.name.casefold(), a.key))
+
+
+def allocated_size(path, timeout=2.0, max_entries=100000):
+    """Bounded, read-only scan. No symlink traversal; count hardlinks once per tree."""
+    start = time.monotonic()
+    seen, pending, total = set(), [Path(path)], 0
+    try:
+        root_stat = Path(path).lstat()
+        if stat.S_ISLNK(root_stat.st_mode):
+            return None, "The installation path is a symlink; not followed"
+        while pending:
+            if time.monotonic() - start > timeout or len(seen) >= max_entries:
+                return None, "Size scan limit reached; partial data was discarded"
+            current = pending.pop()
+            st = current.lstat()
+            if st.st_dev != root_stat.st_dev:
+                return None, "Installation crosses a filesystem; size not combined"
+            key = st.st_dev, st.st_ino
+            if key in seen:
+                continue
+            seen.add(key)
+            total += st.st_blocks * 512
+            if stat.S_ISDIR(st.st_mode):
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        if len(pending) + len(seen) >= max_entries or time.monotonic() - start > timeout:
+                            return None, "Size scan limit reached; partial data was discarded"
+                        pending.append(Path(entry.path))
+        return total, "Filesystem allocated bytes; symlinks not followed, hardlinks counted once within this app"
+    except OSError as exc:
+        return None, "Size unavailable: " + str(exc)
+
+
+def measured_app(app, path, note, timeout=2.0):
+    value, explanation = allocated_size(path, timeout=timeout)
+    return dataclasses.replace(app, size_bytes=value, size_kind="allocated" if value is not None else "unknown",
+                               size_note=note + ". " + explanation)
+
+
+def measure_apps(apps, path_for, note):
+    deadline = time.monotonic() + 8
+    result = []
+    for app in apps:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            result.append(dataclasses.replace(app, size_note="Size scan time budget reached. Refresh to retry."))
+        else:
+            result.append(measured_app(app, path_for(app), note, min(2, remaining)))
+    return result
+
+
+@dataclasses.dataclass(frozen=True)
+class PackageInfo:
+    description: str = "No description is available in the installed package metadata."
+    publisher: str = "Not provided"
+    publisher_role: str = "Developer / publisher"
+    category: str = "Unknown"
+    category_basis: str = "No category was provided"
+    homepage: str = ""
+    source: str = "Installed package metadata"
+    notes: str = ""
+
+
+def clean_info(value, limit=16000):
+    value = str(value or "").replace("\r", "")
+    return ''.join(c for c in value if c in '\n\t' or (ord(c) >= 32 and ord(c) != 127))[:limit].strip()
+
+
+def package_type(description, section="", categories=()):
+    """Conservative labels from metadata. Never guess a vendor from a name."""
+    declared = set(categories)
+    for key, label in [('WebBrowser', 'Web browser'), ('Game', 'Game'), ('Office', 'Office software'),
+                       ('Graphics', 'Graphics software'), ('AudioVideo', 'Media software'),
+                       ('Development', 'Development tools'), ('Utility', 'Utility'), ('System', 'System tool')]:
+        if key in declared:
+            return label, 'Declared desktop category: ' + key
+    text = description.split('\n', 1)[0].lower()
+    section = section.lower().rsplit('/', 1)[-1]
+    if section in ('doc', 'documentation') or re.search(r'\b(documentation|manual pages)\b', text.split('\n')[0]):
+        label = 'Documentation'
+    elif section in ('libdevel', 'devel') or re.search(r'\b(development files|header files|development headers)\b', text):
+        label = 'Development tools / files'
+    elif re.search(r'\bfirmware\b', text):
+        label = 'Device firmware'
+    elif re.search(r'\b(driver|drivers)\b', text):
+        label = 'Hardware / graphics driver'
+    elif section in ('libs', 'oldlibs') or re.search(r'\b(shared library|shared libraries|runtime library)\b', text):
+        label = 'Library / dependency'
+    elif re.search(r'\b(web browser|internet browser)\b', text):
+        label = 'Web browser'
+    elif re.search(r'\b(media player|video player|audio player)\b', text):
+        label = 'Media player'
+    elif re.search(r'\b(text editor|code editor)\b', text):
+        label = 'Text / code editor'
+    elif section == 'shells' or re.search(r'\b(command shell|shell|command language interpreter)\b', text):
+        label = 'Command shell'
+    elif re.search(r'\b(programming language|object.oriented language|language interpreter)\b', text):
+        label = 'Programming language / runtime'
+    elif section in ('fonts', 'x11-fonts'):
+        label = 'Fonts'
+    elif section in ('games',):
+        label = 'Game'
+    elif section in ('admin', 'base', 'kernel'):
+        label = 'System component / tool'
+    else:
+        return 'Unknown', 'No reliable category found in metadata'
+    return label + ' (inferred)', 'Inferred from package description / section; not a safety assessment'
+
+
+def make_info(description="", publisher="", role="Developer / publisher", section="", categories=(), homepage="", source="Installed package metadata", notes=""):
+    description = clean_info(description)
+    category, basis = package_type(description, section, categories)
+    publisher = clean_info(publisher, 500)
+    if publisher.lower() in ('(none)', 'none', 'unknown', 'n/a'):
+        publisher = ''
+    homepage = clean_info(homepage, 2000)
+    if not homepage.startswith(('https://', 'http://')):
+        homepage = ''
+    return PackageInfo(description or PackageInfo.description, publisher or 'Not provided', role,
+                       category, basis + (f'; section: {section}' if section else ''), homepage, source, clean_info(notes, 2000))
+
+
+def read_info_file(path, limit=262144):
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size > limit:
+        raise ValueError('Metadata file is missing or too large')
+    with path.open('rb') as stream:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError('Metadata file is too large')
+    return data.decode('utf-8', errors='replace')
+
+
+def parse_key_info(output):
+    fields, current = {}, None
+    for line in output.splitlines():
+        if line and not line[0].isspace() and ':' in line:
+            current, value = line.split(':', 1)
+            current = current.strip()
+            fields[current] = value.strip()
+        elif current and line[:1].isspace():
+            fields[current] += ' ' + line.strip()
+    return fields
+
+
+def flatpak_package_info(app):
+    from xml.etree import ElementTree as ET
+    location = Path(read_command([tool('flatpak'), 'info', flatpak_scope(app.scope), '--show-location', app.ident], timeout=6).strip())
+    if not location.is_absolute():
+        raise ValueError('Flatpak did not return an absolute installation path')
+    app_id = app.ident.split('/')[1]
+    # Match the component ID, never take another bundled component's identity.
+    for folder in ('metainfo', 'appdata'):
+        directory = location / 'files/share' / folder
+        for path in sorted(directory.glob('*.xml'))[:100]:
+            raw = read_info_file(path)
+            if '<!DOCTYPE' in raw.upper() or '<!ENTITY' in raw.upper():
+                continue
+            try:
+                root = ET.fromstring(raw)
+            except ET.ParseError:
+                continue
+            for node in ([root] if root.tag == 'component' else root.findall('component')):
+                if node.findtext('id', '').removesuffix('.desktop') != app_id:
+                    continue
+                def local(tag):
+                    return next((x for x in node.findall(tag) if not x.get('{http://www.w3.org/XML/1998/namespace}lang')), None)
+                def words(element):
+                    return ' '.join(element.itertext()).strip() if element is not None else ''
+                description = '\n\n'.join(filter(None, [words(local('summary')), words(local('description'))]))
+                developer = words(local('developer/name')) or words(local('developer_name'))
+                url = next((x.text for x in node.findall('url') if x.get('type') == 'homepage'), '')
+                return make_info(description, developer, 'Developer', categories=[x.text for x in node.findall('categories/category')], homepage=url,
+                                 source='Installed Flatpak AppStream metadata', notes=app.note)
+    return make_info(source='Installed Flatpak metadata', notes='No matching local AppStream description was found. ' + app.note)
+
+
+def snap_package_info(app):
+    import http.client
+    import socket
+    from urllib.parse import quote
+    class SnapConnection(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(self.timeout)
+            self.sock.connect('/run/snapd.socket')
+    connection = SnapConnection('localhost', timeout=4)
+    try:
+        connection.request('GET', '/v2/snaps/' + quote(app.ident, safe=''))
+        response = connection.getresponse()
+        body = response.read(262145)
+        if response.status != 200 or len(body) > 262144:
+            raise ValueError('Local snapd metadata is unavailable')
+        data = json.loads(body)['result']
+        publisher = data.get('publisher') or {}
+        name = publisher.get('display-name') or publisher.get('username') or data.get('developer', '')
+        description = '\n\n'.join(filter(None, [data.get('summary'), data.get('description')]))
+        return make_info(description, name, 'Snap publisher', homepage=data.get('website', ''),
+                         source='Local snapd installed-snap metadata', notes='Snap type: ' + data.get('type', 'unknown') + '. Publisher may be a third-party packager.')
+    finally:
+        connection.close()
+
+
+def pipx_package_info(app):
+    from email.parser import Parser
+    data = json.loads(read_command([tool('pipx'), 'list', '--json'], timeout=6))
+    package = data['venvs'][app.ident]['metadata']['main_package'].get('package', app.ident)
+    norm = lambda text: re.sub(r'[-_.]+', '-', text).lower()
+    root = Path(read_command([tool('pipx'), 'environment', '--value', 'PIPX_LOCAL_VENVS'], timeout=6).strip())
+    if not root.is_absolute() or '/' in app.ident:
+        raise ValueError('Unexpected pipx installation path')
+    for path in sorted((root / app.ident / 'lib').glob('python*/site-packages/*.dist-info/METADATA'))[:1000]:
+        message = Parser().parsestr(read_info_file(path))
+        if norm(message.get('Name', '')) != norm(package):
+            continue
+        publisher = message.get('Author') or message.get('Author-email') or ''
+        role = 'Author'
+        if not publisher:
+            publisher = message.get('Maintainer') or message.get('Maintainer-email') or ''
+            role = 'Maintainer'
+        homepage = message.get('Home-page', '')
+        for url in message.get_all('Project-URL', []):
+            label, sep, value = url.partition(',')
+            if sep and label.strip().lower() == 'homepage':
+                homepage = value.strip()
+        return make_info(message.get('Summary', ''), publisher, role, homepage=homepage,
+                         source='Installed Python distribution METADATA', notes='pipx environment: ' + app.ident)
+    return make_info(source='Installed pipx environment', notes='No matching distribution metadata was found.')
+
+
+def brew_package_info(app):
+    cellar = Path(read_command([tool('brew'), '--cellar'], timeout=6).strip())
+    if not cellar.is_absolute():
+        raise ValueError('Unexpected Homebrew Cellar path')
+    name = app.ident.rsplit('/', 1)[-1]
+    # Read the installed formula as text; never execute Ruby or fetch a formula.
+    for path in sorted((cellar / name).glob('*/.brew/' + name + '.rb'), reverse=True)[:32]:
+        raw = read_info_file(path)
+        def field(key):
+            match = re.search(r'^\s*' + key + r'''\s+(["'])(.*?)\1\s*$''', raw, re.M)
+            return match[2] if match and '#{' not in match[2] else ''
+        return make_info(field('desc'), homepage=field('homepage'), source='Installed Homebrew formula',
+                         notes='Homebrew does not provide a standard developer/company field here.')
+    return make_info(source='Installed Homebrew formula', notes='No local formula description was found.')
+
+
+def appimage_package_info(app):
+    directory = xdg_root('XDG_DATA_HOME', '.local/share') / 'applications'
+    for path in sorted(directory.glob('*.desktop'))[:1000]:
+        try:
+            config = configparser.ConfigParser(interpolation=None, strict=False)
+            config.read_string(read_info_file(path))
+            entry = config['Desktop Entry']
+            command = shlex.split(entry.get('Exec', ''))
+            if not command or command[0] != app.ident:
+                continue
+            return make_info(entry.get('Comment') or entry.get('GenericName', ''), categories=entry.get('Categories', '').split(';'),
+                             source='Matching local AppImage desktop entry', notes='AppImage files are not executed to inspect metadata. Developer identity is not available in standard desktop entries.')
+        except (OSError, ValueError, KeyError, configparser.Error):
+            continue
+    return make_info(source='AppImage file', notes='No matching local desktop description was found. The AppImage was not executed or mounted.')
+
+
+def get_package_info(app):
+    """Read only local metadata. Failure must not block selection or removal."""
+    fallback = app.note if app.manager in ('APT', 'Pacman', 'DNF', 'Zypper') else ''
+    try:
+        if app.manager != 'AppImage' and not valid_ident(app.ident):
+            raise ValueError('Invalid package identifier')
+        if app.manager == 'APT':
+            fields = ('Description', 'Maintainer', 'Homepage', 'Section')
+            fmt = '\x1f'.join('${' + key + '}' for key in fields)
+            values = read_command([tool('dpkg-query', True), '-W', '-f=' + fmt, app.ident], timeout=6).split('\x1f')
+            if len(values) != 4:
+                raise ValueError('Unexpected dpkg metadata')
+            description = '\n'.join('' if line.strip() == '.' else line.strip() for line in values[0].splitlines())
+            return make_info(description, values[1], 'Package maintainer', values[3], homepage=values[2], source='Installed dpkg package metadata',
+                             notes='The package maintainer packages this software for the distribution and may differ from its original developer.')
+        if app.manager == 'Pacman':
+            fields = parse_key_info(read_command([tool('pacman', True), '-Qi', app.ident], timeout=6))
+            return make_info(fields.get('Description'), fields.get('Packager'), 'Packager', homepage=fields.get('URL'), source='Installed Pacman package metadata',
+                             notes='The packager may differ from the original developer. Groups: ' + fields.get('Groups', 'not provided'))
+        if app.manager in ('DNF', 'Zypper'):
+            fmt = '\x1f'.join('%{' + key + '}' for key in ('DESCRIPTION', 'VENDOR', 'PACKAGER', 'URL', 'GROUP'))
+            values = read_command([tool('rpm', True), '-q', '--qf', fmt, app.ident], timeout=6).split('\x1f')
+            if len(values) != 5:
+                raise ValueError('Unexpected RPM metadata')
+            vendor = values[1] if values[1] not in ('(none)', '') else values[2]
+            return make_info(values[0], vendor, 'Vendor' if vendor == values[1] else 'Packager', values[4], homepage=values[3], source='Installed RPM package metadata',
+                             notes='Vendor/packager metadata may describe the distributor rather than the original developer.')
+        loaders = {'Flatpak': flatpak_package_info, 'Snap': snap_package_info, 'pipx': pipx_package_info,
+                   'Homebrew': brew_package_info, 'AppImage': appimage_package_info}
+        if app.manager in loaders:
+            return loaders[app.manager](app)
+        return make_info(fallback)
+    except Exception as exc:
+        return make_info(fallback, source=app.manager + ' local metadata', notes='Additional details unavailable: ' + clean_info(exc, 500))
 
 
 def tool(name, system=False):
@@ -82,10 +436,28 @@ def tool(name, system=False):
 
 def read_command(argv, timeout=45):
     proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, errors="replace", env=ENV, timeout=timeout)
+                          text=False, env=ENV, timeout=timeout)
     if proc.returncode:
-        raise RuntimeError((proc.stderr or proc.stdout or "Command failed").strip()[:1500])
-    return proc.stdout
+        err = proc.stderr
+        try:
+            err = err.decode('utf-8', errors='replace')
+        except Exception:
+            pass
+        out = proc.stdout
+        try:
+            out = out.decode('utf-8', errors='replace')
+        except Exception:
+            pass
+        raise RuntimeError((err or out or "Command failed").strip()[:1500])
+    try:
+        out = proc.stdout.decode('utf-8')
+        # Replace non-breaking spaces
+        out = out.replace('\u00a0', ' ')
+        return out
+    except Exception:
+        out = proc.stdout.decode('latin-1')
+        out = out.replace('\u00a0', ' ')
+        return out
 
 
 def valid_ident(value):
@@ -100,54 +472,81 @@ def guarded(app):
 def parse_apt(output):
     result = []
     for line in output.splitlines():
-        cols = line.split("\t", 4)
-        if len(cols) != 5:
+        cols = line.split("\t", 5)
+        if len(cols) not in (5, 6):
             raise ValueError("Unexpected dpkg-query output")
-        name, version, status, essential, summary = cols
+        name, version, status, essential = cols[:4]
+        size, summary = (cols[4], cols[5]) if len(cols) == 6 else ("", cols[4])
         if status == "installed":
             result.append(App("APT", name, name, version, note=summary,
-                              protected=essential == "yes"))
+                              protected=essential == "yes", size_bytes=parse_size(size, "KiB"),
+                              size_kind="reported" if parse_size(size, "KiB") is not None else "unknown",
+                              size_note="dpkg Installed-Size estimate; excludes separately installed dependencies and user data"))
     return result
 
 
 def scan_apt():
-    fmt = "${binary:Package}\t${Version}\t${db:Status-Status}\t${Essential}\t${binary:Summary}\\n"
+    fmt = "${binary:Package}\t${Version}\t${db:Status-Status}\t${Essential}\t${Installed-Size}\t${binary:Summary}\\n"
     return parse_apt(read_command([tool("dpkg-query", True), "-W", "-f=" + fmt]))
 
 
-def scan_pacman():
+def parse_pacman(output):
     result = []
-    for line in read_command([tool("pacman", True), "-Q"]).splitlines():
-        name, version = line.split(" ", 1)
-        result.append(App("Pacman", name, name, version, note="Includes installed AUR / local packages"))
+    for block in re.split(r"\n\s*\n", output.strip()):
+        fields = {}
+        for line in block.splitlines():
+            if line and not line[0].isspace() and ":" in line:
+                key, value = line.split(":", 1)
+                fields[key.strip()] = value.strip()
+        if "Name" not in fields:
+            if block.strip():
+                raise ValueError("Unexpected pacman -Qi output")
+            continue
+        value = parse_size(fields.get("Installed Size", ""))
+        result.append(App("Pacman", fields["Name"], fields["Name"], fields.get("Version", ""),
+                          note=fields.get("Description", ""), size_bytes=value,
+                          size_kind="reported" if value is not None else "unknown",
+                          size_note="Pacman Installed Size (rounded metadata); dependencies and user data excluded"))
     return result
+
+
+def scan_pacman():
+    return parse_pacman(read_command([tool("pacman", True), "-Qi"]))
 
 
 def scan_rpm(manager):
-    fmt = "%{NAME}.%{ARCH}\t%{VERSION}-%{RELEASE}\t%{SUMMARY}\\n"
+    fmt = "%{NAME}.%{ARCH}\t%{VERSION}-%{RELEASE}\t%|LONGSIZE?{%{LONGSIZE}}:{%{SIZE}}|\t%{SUMMARY}\\n"
     result = []
     for line in read_command([tool("rpm", True), "-qa", "--qf", fmt]).splitlines():
-        name, version, summary = line.split("\t", 2)
+        cols = line.split("\t", 3)
+        name, version = cols[:2]
+        size, summary = (cols[2], cols[3]) if len(cols) == 4 else ("", cols[2])
         base = name.rsplit(".", 1)[0]
         result.append(App(manager, name, base, version, note=summary,
-                          protected=bool(CORE.fullmatch(base))))
+                          protected=bool(CORE.fullmatch(base)), size_bytes=parse_size(size),
+                          size_kind="reported" if parse_size(size) is not None else "unknown",
+                          size_note="RPM installed-file size metadata; dependencies and user data excluded"))
     return result
 
 
-def parse_flatpak(output, scope):
+def parse_flatpak(output, scope, pkg_type="app"):
     result = []
     for line in output.splitlines():
         if not line.strip():
             continue
         cols = line.split("\t")
-        if len(cols) != 4:
+        if len(cols) not in (4, 5):
             raise ValueError("Flatpak needs support for --columns=ref,name,version,origin")
-        ref, name, version, origin = cols
-        if not ref.startswith("app/"):
-            ref = "app/" + ref
+        ref, name, version, origin = cols[:4]
+        value = parse_size(cols[4]) if len(cols) == 5 else None
+        # Prefix the ref with type for filtering
+        if not ref.startswith(("app/", "runtime/", "platform/")):
+            ref = pkg_type + "/" + ref
         if len(ref.split("/")) != 4:
             raise ValueError("Unexpected Flatpak reference: " + ref)
-        result.append(App("Flatpak", ref, name, version, scope, "Remote: " + origin))
+        result.append(App("Flatpak", ref, name, version, scope, "Remote: " + origin,
+                          size_bytes=value, size_kind="reported" if value is not None else "unknown",
+                          size_note="Flatpak reported deployment size (rounded); shared runtimes, deduplication and user data are not apportioned"))
     return result
 
 
@@ -160,8 +559,12 @@ def flatpak_scope(scope):
 
 
 def scan_flatpak(scope):
-    return parse_flatpak(read_command([tool("flatpak"), "list", flatpak_scope(scope),
-                                      "--app", "--columns=ref,name,version,origin"]), scope)
+    # Scan both applications and runtimes separately
+    apps = parse_flatpak(read_command([tool("flatpak"), "list", flatpak_scope(scope),
+                                       "--app", "--columns=ref,name,version,origin,size"]), scope, pkg_type="app")
+    runtimes = parse_flatpak(read_command([tool("flatpak"), "list", flatpak_scope(scope),
+                                           "--runtime", "--columns=ref,name,version,origin,size"]), scope, pkg_type="runtime")
+    return apps + runtimes
 
 
 def flatpak_installations():
@@ -187,7 +590,7 @@ def parse_snap(output):
     return result
 
 
-def scan_snap():
+def scan_snap(include_sizes=True):
     # snap list returns 0 and a header when installed entries exist.
     p = subprocess.run([tool("snap", True), "list"], capture_output=True,
                        text=True, env=ENV, timeout=45)
@@ -195,7 +598,11 @@ def scan_snap():
         return []
     if p.returncode:
         raise RuntimeError(p.stderr.strip())
-    return parse_snap(p.stdout)
+    apps = parse_snap(p.stdout)
+    if not include_sizes:
+        return apps
+    return [measured_app(a, Path("/var/lib/snapd/snaps") / (a.ident + "_" + a.note.split()[-1] + ".snap"),
+                         "Current compressed Snap revision only; older revisions, snapshots and user data excluded") for a in apps]
 
 
 def parse_pipx(output):
@@ -207,17 +614,38 @@ def parse_pipx(output):
     return result
 
 
-def scan_pipx():
-    return parse_pipx(read_command([tool("pipx"), "list", "--json"]))
+def scan_pipx(include_sizes=True):
+    apps = parse_pipx(read_command([tool("pipx"), "list", "--json"]))
+    if not apps or not include_sizes:
+        return apps
+    try:
+        root = Path(read_command([tool("pipx"), "environment", "--value", "PIPX_LOCAL_VENVS"]).strip())
+        if not root.is_absolute():
+            raise ValueError("No absolute pipx environment path")
+        if any("/" in a.ident or ".." in a.ident for a in apps):
+            raise ValueError("Unexpected pipx environment name")
+        return measure_apps(apps, lambda a: root / a.ident,
+                            "pipx environment including private dependencies; shared Python and user data excluded")
+    except Exception as exc:
+        return [dataclasses.replace(a, size_note="pipx size unavailable: " + str(exc)) for a in apps]
 
 
-def scan_brew():
+def scan_brew(include_sizes=True):
     result = []
     for line in read_command([tool("brew"), "list", "--formula", "--versions"]).splitlines():
         name, *versions = line.split()
         result.append(App("Homebrew", name, name, " ".join(versions), "user",
                           "Installed Homebrew formula"))
-    return result
+    if not result or not include_sizes:
+        return result
+    try:
+        cellar = Path(read_command([tool("brew"), "--cellar"]).strip())
+        if not cellar.is_absolute():
+            raise ValueError("No absolute Homebrew Cellar path")
+        return measure_apps(result, lambda a: cellar / a.ident.split("/")[-1],
+                            "Homebrew formula directory including installed versions; other formulae and user data excluded")
+    except Exception as exc:
+        return [dataclasses.replace(a, size_note="Homebrew size unavailable: " + str(exc)) for a in result]
 
 
 def image_roots():
@@ -241,7 +669,7 @@ def appimage_valid(path):
         return False
 
 
-def scan_appimages(extra=()):
+def scan_appimages(extra=(), include_sizes=True):
     paths = set()
     for root in image_roots():
         if root.is_dir() and not root.is_symlink():
@@ -249,36 +677,48 @@ def scan_appimages(extra=()):
             paths.update(root.glob("*"))
             paths.update(root.glob("*/*"))
     paths.update(Path(p) for p in extra)
-    return [App("AppImage", str(p), p.stem, "portable", "user", "File: " + str(p))
+    apps = [App("AppImage", str(p), p.stem, "portable", "user", "File: " + str(p))
             for p in sorted(paths) if appimage_valid(p)]
+    if not include_sizes:
+        return apps
+    return [measured_app(app, app.ident,
+                         "AppImage file only; external config/data excluded; uninstall moves this file to backup")
+            for app in apps]
 
 
-def scan_all(extra=()):
+def scan_all(extra=(), enabled=None):
+    """Scan every enabled source. `enabled` is the set of managers to include."""
     jobs, warnings = [], []
-    if tool("apt-get", True) and tool("dpkg-query", True):
+    enabled = set(SOURCES) if enabled is None else set(enabled)
+
+    def wanted(source):
+        return source in enabled
+    if wanted("APT") and tool("apt-get", True) and tool("dpkg-query", True):
         jobs.append(("APT", scan_apt))
-    if tool("pacman", True):
+    if wanted("Pacman") and tool("pacman", True):
         jobs.append(("Pacman", scan_pacman))
-    if tool("rpm", True):
-        if tool("zypper", True):
-            jobs.append(("Zypper", lambda: scan_rpm("Zypper")))
-        elif tool("dnf", True) or tool("dnf5", True):
-            jobs.append(("DNF", lambda: scan_rpm("DNF")))
-        else:
-            warnings.append("RPM database found, but no supported DNF/Zypper frontend.")
-    if tool("snap", True):
+    if wanted("Zypper") or wanted("DNF"):
+        if tool("rpm", True):
+            if tool("zypper", True) and wanted("Zypper"):
+                jobs.append(("Zypper", lambda: scan_rpm("Zypper")))
+            elif (tool("dnf", True) or tool("dnf5", True)) and wanted("DNF"):
+                jobs.append(("DNF", lambda: scan_rpm("DNF")))
+            elif wanted("Zypper") or wanted("DNF"):
+                warnings.append("RPM database found, but no supported DNF/Zypper frontend.")
+    if wanted("Snap") and tool("snap", True):
         jobs.append(("Snap", scan_snap))
-    if tool("flatpak"):
+    if wanted("Flatpak") and tool("flatpak"):
         try:
             for scope in flatpak_installations():
                 jobs.append(("Flatpak " + scope, lambda s=scope: scan_flatpak(s)))
         except Exception as exc:
             warnings.append("Flatpak installations: " + str(exc))
-    if tool("pipx"):
+    if wanted("pipx") and tool("pipx"):
         jobs.append(("pipx", scan_pipx))
-    if tool("brew"):
+    if wanted("Homebrew") and tool("brew"):
         jobs.append(("Homebrew", scan_brew))
-    jobs.append(("AppImage", lambda: scan_appimages(extra)))
+    if wanted("AppImage"):
+        jobs.append(("AppImage", lambda: scan_appimages(extra)))
     apps = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(fn): label for label, fn in jobs}
@@ -564,7 +1004,7 @@ def lock_operation():
 
 def inventory_for(manager, scope, extra=()):
     if manager == "AppImage":
-        found = scan_appimages(extra)
+        found = scan_appimages(extra, include_sizes=False)
     elif manager == "APT":
         found = scan_apt()
     elif manager == "Pacman":
@@ -574,11 +1014,11 @@ def inventory_for(manager, scope, extra=()):
     elif manager == "Flatpak":
         found = scan_flatpak(scope)
     elif manager == "Snap":
-        found = scan_snap()
+        found = scan_snap(include_sizes=False)
     elif manager == "pipx":
-        found = scan_pipx()
+        found = scan_pipx(include_sizes=False)
     elif manager == "Homebrew":
-        found = scan_brew()
+        found = scan_brew(include_sizes=False)
     else:
         raise ValueError("Unsupported manager")
     return found
@@ -859,6 +1299,159 @@ def install_launcher():
 
 
 
+DARK_BACKGROUNDS = {
+    '#f5f5ef': '#101b18', 'white': '#182722', '#ffffff': '#182722',
+    '#eef1e9': '#23392e', '#fafbf8': '#1c2c25', '#e4f2d5': '#35513a',
+    '#e7eedf': '#243a2b', '#e4ebd9': '#243a2b', '#e7ecdf': '#293f33',
+    '#193c34': '#112d26', '#284a40': '#234a3c', '#c8ef9b': '#c0e994',
+    '#d9edc1': '#35513a', '#d5ded0': '#34493c', '#dce3d6': '#34493c',
+    '#d9e1d2': '#46614d', '#f6f7f3': '#182722', '#e4e9dd': '#24382b',
+    '#d9d9d9': '#34493c', '#000000': '#e7f2e3', 'black': '#e7f2e3',
+}
+DARK_FOREGROUNDS = {
+    '#19332f': '#e7f2e3', '#16243a': '#e7f2e3', '#67776e': '#afc0b2',
+    '#193c34': '#c0e994', '#8b958c': '#87978b', '#91a18f': '#899989',
+    'black': '#e7f2e3', '#000000': '#e7f2e3', '#62748c': '#afc0b2',
+}
+
+
+# Accent palettes. Every value is fixed here so an accent can never be mixed
+# with, or derived from, the light/dark theme. The sidebar uses the accent's
+# dark tone; buttons and selections use its bright tone.
+ACCENTS = {
+    'green': {'accent': '#c8ef9b', 'ink': '#19332f', 'side': '#193c34',
+              'side_soft': '#284a40', 'side_text': '#d4e1d3', 'side_muted': '#b4c8b8'},
+    'red': {'accent': '#ef5f63', 'ink': '#3d0b0d', 'side': '#4a1a1d',
+            'side_soft': '#5f2427', 'side_text': '#ffd9da', 'side_muted': '#e0a9ab'},
+    'yellow': {'accent': '#f2d64b', 'ink': '#3a2d00', 'side': '#3d3413',
+               'side_soft': '#54471b', 'side_text': '#f7ecc4', 'side_muted': '#d8c98d'},
+    'pink': {'accent': '#ef6fa9', 'ink': '#3d0722', 'side': '#45182c',
+             'side_soft': '#5c2339', 'side_text': '#ffdcec', 'side_muted': '#e3a6c3'},
+    'blue': {'accent': '#6fa8f5', 'ink': '#0a2444', 'side': '#142a45',
+             'side_soft': '#1f3d60', 'side_text': '#dbe8fb', 'side_muted': '#a5bcd9'},
+    'cyan': {'accent': '#4fd4dc', 'ink': '#04343a', 'side': '#0e3438',
+             'side_soft': '#164a4f', 'side_text': '#d5f6f8', 'side_muted': '#95c9cd'},
+}
+SOURCES = ("APT", "Pacman", "DNF", "Zypper", "Snap", "Flatpak", "pipx", "Homebrew", "AppImage")
+
+
+def blend(color, other, amount):
+    """Mix two #rrggbb colours. Used only to derive safe tints of one accent."""
+    try:
+        first = tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+        second = tuple(int(other[i:i + 2], 16) for i in (1, 3, 5))
+    except (TypeError, ValueError, IndexError):
+        return color
+    return '#' + ''.join(f'{round(a + (b - a) * amount):02x}' for a, b in zip(first, second))
+
+
+def load_preferences():
+    path = STORE / 'preferences.json'
+    data = {}
+    try:
+        if not path.is_symlink() and path.stat().st_size <= 4096:
+            data = json.loads(path.read_text())
+    except (OSError, ValueError, AttributeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    theme = data.get('theme')
+    accent = data.get('accent')
+    disabled = data.get('disabled_sources')
+    return {
+        'theme': theme if theme in ('light', 'dark') else 'light',
+        'accent': accent if accent in ACCENTS else 'green',
+        'disabled_sources': sorted({s for s in disabled if s in SOURCES})
+        if isinstance(disabled, list) else [],
+    }
+
+
+def save_preferences(**changes):
+    data = load_preferences()
+    data.update(changes)
+    atomic_json(private_store() / 'preferences.json', data)
+    return data
+
+
+def load_theme():
+    return load_preferences()['theme']
+
+
+def save_theme(mode):
+    if mode not in ('light', 'dark'):
+        raise ValueError('Unknown theme')
+    save_preferences(theme=mode)
+
+
+def save_accent(name):
+    if name not in ACCENTS:
+        raise ValueError('Unknown accent colour')
+    save_preferences(accent=name)
+
+
+def save_disabled_sources(names):
+    unknown = set(names) - set(SOURCES)
+    if unknown:
+        raise ValueError('Unknown package source: ' + ', '.join(sorted(unknown)))
+    save_preferences(disabled_sources=sorted(set(names)))
+
+
+class RowCache:
+    """Per-scan lookup tables so repaints never redo expensive per-row work."""
+
+    def __init__(self, apps):
+        self.apps = list(apps)
+        self.protected = {}
+        self.search = {}
+        self.size = {}
+        self.by_source = {}
+        self.counts = {}
+        self.order_name = []
+
+    def build(self):
+        for app in self.apps:
+            key = app.key
+            self.protected[key] = guarded(app)
+            self.search[key] = (app.name + " " + app.ident + " " + app.note).casefold()
+            self.size[key] = (("≈ " if app.size_kind == "reported" and app.size_bytes is not None else "")
+                              + format_size(app.size_bytes))
+            self.by_source.setdefault(app.manager, []).append(app)
+            self.counts[app.manager] = self.counts.get(app.manager, 0) + 1
+        self.order_name = sorted(self.apps, key=lambda a: (a.name.casefold(), a.key))
+        return self
+
+    def is_protected(self, app):
+        return self.protected.get(app.key, False)
+
+    def matches(self, app, query):
+        return not query or query in self.search.get(app.key, '')
+
+    def sorted_by(self, order):
+        if order == 'largest':
+            return sorted(self.apps, key=lambda a: (a.size_bytes is None, -(a.size_bytes or 0),
+                                                    a.name.casefold(), a.key))
+        if order == 'smallest':
+            return sorted(self.apps, key=lambda a: (a.size_bytes is None, a.size_bytes or 0,
+                                                    a.name.casefold(), a.key))
+        return self.order_name
+
+
+class EmptyCache:
+    """Stand-in used before the first scan finishes."""
+
+    counts = {}
+    by_source = {}
+
+    def is_protected(self, app):
+        return guarded(app)
+
+    def matches(self, app, query):
+        return True
+
+    def sorted_by(self, order):
+        return []
+
+
 class PocketUI:
     def __init__(self, root):
         import tkinter as tk
@@ -866,123 +1459,220 @@ class PocketUI:
         from tkinter.scrolledtext import ScrolledText
         self.tk, self.ttk, self.dialog, self.files, self.Text = tk, ttk, messagebox, filedialog, ScrolledText
         self.root = root
+        preferences = load_preferences()
+        self.theme_mode = preferences['theme']
+        self.accent = preferences['accent']
+        self.disabled_sources = set(preferences['disabled_sources'])
+        self.settings_window = None
+        self.settings_page = 'appearance'
+        self.settings_theme_buttons = {}
+        self.settings_accent_buttons = {}
+        self.settings_source_vars = {}
+        self.source_labels = {}
+        self.theme_originals = weakref.WeakKeyDictionary()
+        self.accent_tagged = weakref.WeakKeyDictionary()
+        self.theme_fixed = weakref.WeakKeyDictionary()
+        self.set_accent_palette(self.accent)
+        self.refresh_tints()
+        self.order = "name"
         self.apps, self.visible, self.chosen, self.extra, self.warnings, self.removed = [], {}, {}, [], [], []
-        self.source, self.busy, self.anchor = "All applications", False, None
+        self.cache = EmptyCache()
+        self.painted = {}
+        self.painted_nav = {}
+        self.painted_focus = None
+        self.cells = {}
+        self.selection_state = ()
+        self.selection_dirty = True
+        self.totals_dirty = True
+        self.render_job = None
+        self.source, self.busy, self.anchor = "All", False, None
+        self.flatpak_type = "all"
         self.events = queue.Queue()
-        self.bg, self.ink, self.muted, self.green, self.lime = "#f5f5ef", "#19332f", "#67776e", "#193c34", "#c8ef9b"
+        self.info_requests, self.info_results = queue.Queue(maxsize=1), queue.Queue()
+        self.info_cache, self.info_epoch, self.info_token = {}, 0, None
+        self.info_after, self.current_info = None, None
+        info_requests, info_results = self.info_requests, self.info_results
+        self.info_stop = threading.Event()
+        info_stop = self.info_stop
+        def read_info():
+            while not info_stop.is_set():
+                try:
+                    token, app = info_requests.get(timeout=.5)
+                except queue.Empty:
+                    continue
+                info = get_package_info(app)
+                if not info_stop.is_set():
+                    info_results.put((token, info))
+        threading.Thread(target=read_info, daemon=True).start()
+        root.bind('<Destroy>', lambda event: info_stop.set() if event.widget == root else None, add='+')
+        self.bg, self.ink, self.muted = "#f5f5ef", "#19332f", "#67776e"
+        self.set_accent_palette(self.accent)
         root.title(f"{TITLE}  {VERSION}")
-        root.geometry("1100x740")
+        root.geometry("1140x760")
         root.minsize(900, 620)
         root.configure(bg=self.bg)
         root.option_add("*Font", ("DejaVu Sans", 10))
         style = ttk.Style(root)
         style.theme_use("clam")
         style.configure("Treeview", background="#ffffff", fieldbackground="#ffffff", foreground=self.ink,
-                        rowheight=42, borderwidth=0, font=("DejaVu Sans", 10))
+                        rowheight=38, borderwidth=0, font=("DejaVu Sans", 10))
         style.configure("Treeview.Heading", background="#eef1e9", foreground=self.muted,
-                        font=("DejaVu Sans", 9, "bold"), padding=(8, 11), relief="flat")
+                        font=("DejaVu Sans", 9, "bold"), padding=(8, 8), relief="flat")
         style.map("Treeview", background=[("selected", "#e4f2d5")], foreground=[("selected", self.ink)])
         style.map("Treeview.Heading", background=[("active", "#e4eadf")])
         style.configure("Vertical.TScrollbar", background="#d9e1d2", troughcolor="#f6f7f3", borderwidth=0, arrowsize=13)
         style.configure("TProgressbar", background=self.green, troughcolor="#e4e9dd", borderwidth=0)
-        self.side = tk.Frame(root, bg=self.green, width=212)
+        self.side = tk.Frame(root, bg=self.side_bg, width=212)
         self.side.pack(side="left", fill="y")
         self.side.pack_propagate(False)
-        mark = tk.Canvas(self.side, width=47, height=47, bg=self.green, highlightthickness=0)
-        mark.pack(anchor="w", padx=24, pady=(28, 12))
-        mark.create_rectangle(3, 9, 42, 44, fill=self.lime, outline="")
-        mark.create_rectangle(13, 1, 32, 10, fill=self.lime, outline="")
-        mark.create_line(15, 26, 30, 26, fill=self.green, width=4)
-        tk.Label(self.side, text="pocket", font=("DejaVu Sans", 24, "bold"), bg=self.green, fg="#f4f9ec").pack(anchor="w", padx=24)
-        tk.Label(self.side, text="UNINSTALLER  /  0.2", font=("DejaVu Sans", 8), bg=self.green, fg="#b4c8b8").pack(anchor="w", padx=26, pady=(1, 26))
-        self.nav_canvas = tk.Canvas(self.side, bg=self.green, highlightthickness=0, height=200)
-        self.nav = tk.Frame(self.nav_canvas, bg=self.green)
-        nav_item = self.nav_canvas.create_window((0, 0), window=self.nav, anchor="nw")
-        self.nav.bind("<Configure>", lambda e: self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox("all")))
-        self.nav_canvas.bind("<Configure>", lambda e: self.nav_canvas.itemconfigure(nav_item, width=e.width))
-        bottom = tk.Frame(self.side, bg=self.green)
-        bottom.pack(side="bottom", fill="x", padx=18, pady=22)
-        self.button(bottom, "Install / repair launcher", self.install, dark=True).pack(fill="x", pady=(0, 6))
-        self.button(bottom, "Backups & restore", self.backups, dark=True).pack(fill="x", pady=3)
-        self.button(bottom, "Scan notes", self.notes, dark=True).pack(fill="x", pady=3)
-        tk.Label(bottom, text="Small footprint.\nMore room for what matters.", justify="left", bg=self.green,
-                 fg="#b4c8b8", font=("DejaVu Sans", 9)).pack(anchor="w", pady=(22, 0))
-        self.nav_canvas.pack(fill="both", expand=True, padx=14)
+        self.draw_sidebar()
         main = tk.Frame(root, bg=self.bg)
-        main.pack(side="left", fill="both", expand=True, padx=28, pady=26)
+        main.pack(side="left", fill="both", expand=True, padx=28, pady=16)
         main.columnconfigure(0, weight=1)
         main.rowconfigure(5, weight=1)
-        tk.Label(main, text="YOUR SYSTEM  /  APPLICATIONS", bg=self.bg, fg=self.muted,
-                 font=("DejaVu Sans", 8, "bold")).grid(row=0, column=0, sticky="w")
+        head = tk.Frame(main, bg=self.bg)
+        head.grid(row=0, column=0, sticky="ew")
+        tk.Label(head, text="YOUR SYSTEM  /  STORAGE & APPLICATIONS", bg=self.bg, fg=self.muted,
+                 font=("DejaVu Sans", 8, "bold")).pack(side="left")
         top = tk.Frame(main, bg=self.bg)
-        top.grid(row=1, column=0, sticky="ew", pady=(10, 3))
-        tk.Label(top, text="A little less clutter.", bg=self.bg, fg=self.ink,
-                 font=("DejaVu Sans", 25, "bold")).pack(side="left")
+        top.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        tk.Label(top, text="Your apps. Your space.", bg=self.bg, fg=self.ink,
+                 font=("DejaVu Sans", 22, "bold")).pack(side="left")
         self.total = tk.StringVar(value="READING...")
-        tk.Label(top, textvariable=self.total, bg="#e4ebd9", fg=self.green,
-                 font=("DejaVu Sans", 9, "bold"), padx=12, pady=8).pack(side="right")
-        tk.Label(main, text="Pick your apps. Review once. Let each package manager handle the rest.",
-                 bg=self.bg, fg=self.muted, font=("DejaVu Sans", 10), wraplength=620, justify="left").grid(row=2, column=0, sticky="w", pady=(1, 22))
+        self.total_label = tk.Label(top, textvariable=self.total, font=("DejaVu Sans", 9, "bold"),
+                                    padx=12, pady=8, relief="flat", borderwidth=0)
+        self.total_label.pack(side="right")
+        # The chip is accent-owned: a dark accent colour on a theme surface is
+        # unreadable in dark mode, so both options come from the accent palette.
+        self.tag_accent(self.total_label, {'background': 'accent', 'foreground': 'ink'})
+        metrics = tk.Frame(main, bg=self.bg)
+        metrics.grid(row=2, column=0, sticky="ew", pady=(8, 10))
+        metrics.columnconfigure((0, 1), weight=1, uniform="metrics")
+        self.view_space, self.selected_space = tk.StringVar(value="Unknown"), tk.StringVar(value="0 B")
+        self.view_note, self.selected_note = tk.StringVar(value="Reading installed sizes..."), tk.StringVar(value="Nothing selected")
+        for column, label, value, note in [(0, "IN THIS VIEW", self.view_space, self.view_note),
+                                           (1, "SELECTED APPS", self.selected_space, self.selected_note)]:
+            bg = "white" if column == 0 else "#e7eedf"
+            card = tk.Frame(metrics, bg=bg, padx=12, pady=6)
+            card.grid(row=0, column=column, sticky="ew", padx=(0, 8) if column == 0 else (8, 0))
+            self.tag_accent(card, {'background': 'tint' if column == 0 else 'tint_soft'})
+            value_row = tk.Frame(card, bg=bg)
+            self.tag_accent(value_row, {'background': 'tint' if column == 0 else 'tint_soft'})
+            value_row.pack(fill="x")
+            label_one = tk.Label(value_row, text=label, bg=bg, fg=self.muted, font=("DejaVu Sans", 8, "bold"))
+            label_one.pack(side="left")
+            value_one = tk.Label(value_row, textvariable=value, bg=bg, fg=self.ink, font=("DejaVu Sans", 17, "bold"))
+            value_one.pack(side="right")
+            note_one = tk.Label(card, textvariable=note, bg=bg, fg=self.muted, font=("DejaVu Sans", 8))
+            note_one.pack(anchor="w")
+            for widget in (label_one, value_one, note_one):
+                self.tag_accent(widget, {'background': 'tint' if column == 0 else 'tint_soft'})
         row = tk.Frame(main, bg=self.bg)
-        row.grid(row=3, column=0, sticky="ew", pady=(0, 12))
+        row.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         searchbox = tk.Frame(row, bg="white", highlightbackground="#d5ded0", highlightthickness=1)
+        self.tag_accent(searchbox, {'background': 'tint', 'highlightbackground': 'tint_line'})
         searchbox.pack(side="left", fill="x", expand=True)
-        tk.Label(searchbox, text="Search", bg="white", fg=self.muted, padx=12).pack(side="left")
+        search_label = tk.Label(searchbox, text="Search", bg="white", fg=self.muted, padx=12)
+        search_label.pack(side="left")
         self.search = tk.StringVar()
-        self.entry = tk.Entry(searchbox, textvariable=self.search, relief="flat", borderwidth=0,
+        self.entry = tk.Entry(searchbox, textvariable=self.search, relief="flat", borderwidth=0, highlightthickness=0,
                               bg="white", fg=self.ink, insertbackground=self.ink, font=("DejaVu Sans", 11))
-        self.entry.pack(side="left", fill="x", expand=True, ipady=11)
-        tk.Button(searchbox, text="×", command=lambda: self.search.set(""), bg="white", fg=self.muted,
-                  relief="flat", borderwidth=0, cursor="hand2").pack(side="right", padx=7)
+        self.entry.pack(side="left", fill="x", expand=True, ipady=8)
+        self.tag_accent(self.entry, {'background': 'tint', 'insertbackground': 'accent'})
+        clear = tk.Button(searchbox, text="×", command=lambda: self.search.set(""), bg="white", fg=self.muted,
+                          relief="flat", borderwidth=0, highlightthickness=0, cursor="hand2")
+        clear.pack(side="right", padx=7)
+        for widget in (search_label, clear):
+            self.tag_accent(widget, {'background': 'tint'})
         self.refresh_button = self.button(row, "Refresh", self.refresh)
         self.refresh_button.pack(side="right", padx=(10, 0))
         actions = tk.Frame(main, bg=self.bg)
-        actions.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        actions.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         self.button(actions, "Select visible", self.select_visible, compact=True).pack(side="left")
         self.button(actions, "Clear selection", self.clear, compact=True).pack(side="left", padx=6)
+        # Flatpak filter controls - only shown when Flatpak source is selected
+        self.flatpak_frame = tk.Frame(actions, bg=self.bg)
+        self.flatpak_frame.pack(side="right", padx=(20, 0))
+        tk.Label(self.flatpak_frame, text="Flatpak:", bg=self.bg, fg=self.muted, font=("DejaVu Sans", 9)).pack(side="left", padx=(0, 6))
+        self.flatpak_all_btn = self.button(self.flatpak_frame, "All", lambda: self.set_flatpak_type("all"), compact=True)
+        self.flatpak_all_btn.pack(side="left")
+        self.flatpak_apps_btn = self.button(self.flatpak_frame, "Apps", lambda: self.set_flatpak_type("apps"), compact=True)
+        self.flatpak_apps_btn.pack(side="left", padx=(2, 0))
+        self.flatpak_runtimes_btn = self.button(self.flatpak_frame, "Runtimes", lambda: self.set_flatpak_type("runtimes"), compact=True)
+        self.flatpak_runtimes_btn.pack(side="left", padx=(2, 0))
         self.button(actions, "+ AppImage", self.add_image, compact=True).pack(side="right")
-        tk.Label(actions, text="↑ ↓ navigate   ·   Space select", bg=self.bg, fg=self.muted,
-                 font=("DejaVu Sans", 8)).pack(side="right", padx=8)
+        self.button(actions, "Size details", self.size_details, compact=True).pack(side="right", padx=6)
         frame = tk.Frame(main, bg="white", highlightbackground="#dce3d6", highlightthickness=1)
+        self.tag_accent(frame, {'background': 'tint', 'highlightbackground': 'tint_line'})
         frame.grid(row=5, column=0, sticky="nsew")
-        self.tree = ttk.Treeview(frame, columns=("check", "name", "source", "version", "scope"),
+        self.tree = ttk.Treeview(frame, columns=("check", "name", "size", "source", "version", "scope"),
                                  show="headings", selectmode="none", takefocus=True)
-        specs = [("check", "", 42, False), ("name", "APPLICATION / PACKAGE", 240, True),
-                 ("source", "SOURCE", 90, False), ("version", "VERSION", 110, True), ("scope", "SCOPE", 85, False)]
+        specs = [("check", "", 36, False), ("name", "APPLICATION / PACKAGE", 230, True),
+                 ("size", "SIZE ↕", 125, False), ("source", "SOURCE", 85, False),
+                 ("version", "VERSION", 100, True), ("scope", "SCOPE", 80, False)]
         for key, title, width, stretch in specs:
             self.tree.heading(key, text=title)
             self.tree.column(key, width=width, minwidth=35 if key == "check" else 55,
                              stretch=stretch, anchor="center" if key == "check" else "w")
+        self.tree.heading("size", command=self.sort_size)
+        self.tree.heading("name", command=self.sort_name)
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         self.tree.pack(fill="both", expand=True)
         self.tree.tag_configure("protected", foreground="#8b958c")
-        self.tree.tag_configure("active", background="#eef1e9")
-        self.tree.tag_configure("odd", background="#fafbf8")
         self.empty = tk.Label(frame, text="Reading installed applications...", bg="white", fg=self.muted)
         self.empty.place(relx=.5, rely=.5, anchor="center")
         self.detail = tk.StringVar(value="Protected system components cannot be selected.")
-        tk.Label(main, textvariable=self.detail, bg=self.bg, fg=self.muted,
-                 anchor="w", font=("DejaVu Sans", 9)).grid(row=6, column=0, sticky="ew", pady=(9, 12))
-        bar = tk.Frame(main, bg="#e7eedf", padx=15, pady=13)
+        info_panel = tk.Frame(main, bg="white", padx=12, pady=8)
+        self.tag_accent(info_panel, {'background': 'tint_soft'})
+        info_panel.grid(row=6, column=0, sticky="ew", pady=(8, 8))
+        info_head = tk.Frame(info_panel, bg="white")
+        self.tag_accent(info_head, {'background': 'tint_soft'})
+        info_head.pack(fill="x")
+        self.info_title = tk.StringVar(value="ABOUT THIS PACKAGE")
+        self.info_description = tk.StringVar(value="Click an app to see what it does.")
+        self.info_identity = tk.StringVar(value="Type and developer / publisher will appear here.")
+        self.info_button = self.button(info_head, "More details", self.package_details, compact=True)
+        self.info_button.pack(side="right", padx=(8, 0))
+        self.info_button.configure(state="disabled")
+        self.info_title_label = tk.Label(info_head, textvariable=self.info_title, bg="white", fg=self.ink,
+                                         anchor="w", font=("DejaVu Sans", 10, "bold"))
+        self.info_title_label.pack(side="left", fill="x", expand=True)
+        self.info_description_label = tk.Label(info_panel, textvariable=self.info_description, bg="white", fg=self.ink,
+                 anchor="nw", justify="left", height=2, font=("DejaVu Sans", 9))
+        self.info_description_label.pack(fill="x", pady=(3, 3))
+        self.info_identity_label = tk.Label(info_panel, textvariable=self.info_identity, bg="white", fg=self.muted,
+                                            anchor="w", font=("DejaVu Sans", 8))
+        self.info_identity_label.pack(fill="x")
+        for widget in (self.info_title_label, self.info_description_label, self.info_identity_label):
+            self.tag_accent(widget, {'background': 'tint_soft'})
+        info_panel.bind('<Configure>', lambda event: self.info_description_label.configure(wraplength=max(200, event.width - 24)))
+        root.bind('<Configure>', lambda event: self.info_description_label.configure(height=1 if event.height < 700 else 2) if event.widget == root else None, add='+')
+        bar = tk.Frame(main, bg="#e7eedf", padx=15, pady=9)
+        self.tag_accent(bar, {'background': 'tint_soft'})
         bar.grid(row=7, column=0, sticky="ew")
         text = tk.Frame(bar, bg="#e7eedf")
+        self.tag_accent(text, {'background': 'tint_soft'})
         text.pack(side="left")
         self.count = tk.StringVar(value="No apps selected")
         self.hint = tk.StringVar(value="Selection stays with you while you search.")
-        tk.Label(text, textvariable=self.count, bg="#e7eedf", fg=self.ink,
-                 font=("DejaVu Sans", 11, "bold")).pack(anchor="w")
-        tk.Label(text, textvariable=self.hint, bg="#e7eedf", fg=self.muted,
-                 font=("DejaVu Sans", 8), wraplength=290, justify="left").pack(anchor="w", pady=(3, 0))
+        self.count_label = tk.Label(text, textvariable=self.count, bg="#e7eedf", fg=self.ink,
+                                    font=("DejaVu Sans", 11, "bold"))
+        self.count_label.pack(anchor="w")
+        self.hint_label = tk.Label(text, textvariable=self.hint, bg="#e7eedf", fg=self.muted,
+                                   font=("DejaVu Sans", 8), wraplength=290, justify="left")
+        self.hint_label.pack(anchor="w", pady=(3, 0))
+        for widget in (self.count_label, self.hint_label):
+            self.tag_accent(widget, {'background': 'tint_soft'})
         self.remove_button = self.button(bar, "Review & uninstall", self.review, primary=True)
         self.remove_button.pack(side="right")
         self.leftover_button = self.button(main, "Review leftovers from completed removals", self.cleanup_dialog, compact=True)
-        self.leftover_button.grid(row=8, column=0, sticky="w", pady=(10, 0))
+        self.leftover_button.grid(row=8, column=0, sticky="w", pady=(6, 0))
         self.leftover_button.configure(state="disabled")
         self.status = tk.StringVar(value="Ready")
         tk.Label(main, textvariable=self.status, bg=self.bg, fg=self.muted,
-                 font=("DejaVu Sans", 8), anchor="w").grid(row=9, column=0, sticky="ew", pady=(8, 0))
+                 font=("DejaVu Sans", 8), anchor="w").grid(row=9, column=0, sticky="ew", pady=(5, 0))
         self.tree.bind("<Button-1>", self.click)
         self.tree.bind("<Double-1>", lambda e: "break")
         self.tree.bind("<space>", self.toggle_focus)
@@ -999,55 +1689,645 @@ class PocketUI:
         root.bind("<Control-f>", lambda e: self.entry.focus_set())
         root.bind("<F5>", lambda e: self.refresh())
         root.protocol("WM_DELETE_WINDOW", self.close)
-        self.search.trace_add("write", lambda *_: self.render())
+        self.search.trace_add("write", lambda *_: self.queue_render())
         self.draw_nav()
+        self.apply_theme(self.theme_mode, persist=False)
+        # Hide Flatpak filter initially (will be shown when Flatpak source is selected)
+        self.flatpak_frame.pack_forget()
+        # Initialize Flatpak filter button appearance
+        self.set_flatpak_type(self.flatpak_type)
         self.pump()
         self.refresh()
 
+    def show_app_info(self, app):
+        token = (self.info_epoch, app.key, app.version) if app else None
+        if token == self.info_token:
+            return
+        self.info_token = token
+        self.current_info = None
+        if self.info_after:
+            self.root.after_cancel(self.info_after)
+            self.info_after = None
+        if not app:
+            self.info_title.set('ABOUT THIS PACKAGE')
+            self.info_description.set('Click an app or move with the arrow keys to see what it does.')
+            self.info_identity.set('Type and developer / publisher will appear here.')
+            self.info_button.configure(state='disabled')
+            self.detail.set('No matching package')
+            return
+        self.info_title.set(('Protected · ' if self.cache.is_protected(app) else '') + app.name[:48] + '  ·  ' + format_size(app.size_bytes))
+        self.info_button.configure(state='disabled')
+        if token in self.info_cache:
+            self.display_info(self.info_cache[token])
+            return
+        self.info_description.set(app.note if app.manager in ('APT', 'Pacman', 'DNF', 'Zypper') else 'Reading the installed package description...')
+        self.info_identity.set('Loading type and developer / publisher...')
+        def submit():
+            self.info_after = None
+            if self.info_token != token:
+                return
+            try:
+                self.info_requests.get_nowait()
+            except queue.Empty:
+                pass
+            self.info_requests.put_nowait((token, app))
+        self.info_after = self.root.after(160, submit)
+
+    def display_info(self, info):
+        self.current_info = info
+        self.info_description.set(' '.join(info.description.split())[:320])
+        publisher = re.sub(r'\s*<[^>]*>', '', info.publisher)
+        self.info_identity.set(f'Type: {info.category}   ·   {info.publisher_role}: {publisher}')
+        self.info_button.configure(state='normal')
+
+    def poll_info(self):
+        try:
+            while True:
+                token, info = self.info_results.get_nowait()
+                if token[0] != self.info_epoch:
+                    continue
+                self.info_cache[token] = info
+                if len(self.info_cache) > 256:
+                    self.info_cache.pop(next(iter(self.info_cache)))
+                if token == self.info_token:
+                    self.display_info(info)
+        except queue.Empty:
+            pass
+
+    def package_details(self):
+        app = self.visible.get(self.tree.focus())
+        info = self.current_info
+        if not app or not info:
+            return
+        lines = [app.name, f'{app.manager} / {app.scope}  ·  {app.ident}', '',
+                 'WHAT IT DOES', info.description, '', 'TYPE', info.category,
+                 info.category_basis, '', info.publisher_role.upper(), info.publisher, '',
+                 'PROJECT WEBSITE', info.homepage or 'Not provided', '',
+                 'INSTALLED SIZE', format_size(app.size_bytes), app.size_note, '',
+                 'INFORMATION SOURCE', info.source, info.notes, '',
+                 'This description identifies the software; it does not establish whether removal is safe. Review the native transaction for dependencies.']
+        self.text_window('About ' + app.name, '\n'.join(lines))
+
     def button(self, parent, text, command, primary=False, dark=False, compact=False):
-        return self.tk.Button(parent, text=text, command=command, relief="flat", borderwidth=0,
-                              bg=self.green if primary else ("#284a40" if dark else "#e7ecdf"),
-                              fg="#f5f9ed" if primary or dark else self.ink,
-                              activebackground=self.lime, activeforeground=self.ink,
+        button = self.tk.Button(parent, text=text, command=command, relief="flat", borderwidth=0, highlightthickness=0,
+                              bg=self.side_bg if primary else (self.side_soft if dark else "#e7ecdf"),
+                              fg="#f5f9ed" if primary or dark else "#19332f",
+                              activebackground=self.lime, activeforeground=self.accent_ink,
                               disabledforeground="#91a18f", font=("DejaVu Sans", 9, "bold"),
-                              padx=12, pady=6 if compact else 11, cursor="hand2", takefocus=True)
+                              padx=12, pady=5 if compact else 10, cursor="hand2", takefocus=True)
+        if primary:
+            self.tag_accent(button, {'background': 'accent', 'foreground': 'ink',
+                                     'activebackground': 'accent_ink', 'activeforeground': 'accent'})
+        elif dark:
+            self.tag_accent(button, {'background': 'soft', 'foreground': 'sidetext',
+                                     'activebackground': 'accent', 'activeforeground': 'ink'})
+        else:
+            # Secondary button: accent-tinted surface, but the text follows the
+            # theme so it stays readable on that surface in both modes.
+            self.tag_accent(button, {'background': 'tint_soft',
+                                     'activebackground': 'accent', 'activeforeground': 'ink'})
+        self.theme_tree(button)
+        return button
+
+    def tag_accent(self, widget, roles):
+        """Mark colour options that come from the accent, never from the theme."""
+        self.accent_tagged[widget] = dict(roles)
+
+    def tag_fixed(self, widget, colors):
+        """Mark colours that belong to a widget's own palette (e.g. a swatch)."""
+        self.theme_fixed[widget] = dict(colors)
+        return widget
+
+    def accent_roles(self, widget):
+        roles = self.accent_tagged.get(widget)
+        if not roles:
+            return {}
+        mapping = {'accent': self.lime, 'ink': self.accent_ink, 'side': self.side_bg,
+                   'accent_ink': self.accent_ink, 'soft': self.side_soft,
+                   'sidetext': self.side_text, 'sidemuted': self.side_muted,
+                   'tint': self.tint, 'tint_soft': self.tint_soft, 'tint_line': self.tint_line}
+        return {key: mapping[role] for key, role in roles.items()}
+
+    def theme_tree(self, widget):
+        try:
+            if not widget.winfo_exists():
+                return
+            options = ('background', 'foreground', 'activebackground', 'activeforeground',
+                       'disabledforeground', 'highlightbackground', 'highlightcolor',
+                       'selectbackground', 'selectforeground', 'insertbackground', 'troughcolor',
+                       'selectcolor')
+            if widget not in self.theme_originals:
+                self.theme_originals[widget] = {key: str(widget.cget(key)) for key in options if key in widget.keys()}
+            original = self.theme_originals[widget]
+            roles = self.accent_roles(widget)
+            fixed = self.theme_fixed.get(widget, {})
+            for key, value in original.items():
+                if key in roles or key in fixed:
+                    continue
+                color = value
+                if self.theme_mode == 'dark':
+                    foreground = key.endswith('foreground') or key == 'insertbackground'
+                    color = (DARK_FOREGROUNDS if foreground else DARK_BACKGROUNDS).get(value.lower(), value)
+                widget.configure(**{key: color})
+            if fixed:
+                widget.configure(**fixed)
+            if roles:
+                widget.configure(**roles)
+            for child in widget.winfo_children():
+                self.theme_tree(child)
+        except self.tk.TclError:
+            pass
+
+    def apply_theme(self, mode, persist=True):
+        if mode not in ('light', 'dark'):
+            return
+        self.theme_mode = mode
+        dark = mode == 'dark'
+        self.refresh_tints()
+        background = self.tint
+        foreground = '#e7f2e3' if dark else self.ink
+        heading = self.heading_bg
+        selected_bg = blend(self.lime, background, .62 if dark else .55)
+        style = self.ttk.Style(self.root)
+        style.configure('Treeview', background=background, fieldbackground=background, foreground=foreground,
+                        bordercolor=heading, lightcolor=heading, darkcolor=heading)
+        style.configure('Treeview.Heading', background=heading, foreground='#c3d3c7' if dark else self.ink)
+        style.map('Treeview', background=[('selected', selected_bg)], foreground=[('selected', foreground)])
+        style.map('Treeview.Heading', background=[('active', self.heading_active)])
+        style.configure('Vertical.TScrollbar', background=blend(self.lime, background, .30), troughcolor=background,
+                        arrowcolor=foreground, bordercolor=background, lightcolor=background, darkcolor=background)
+        self.tree.tag_configure('protected', foreground='#9daf9f' if dark else '#6d7a70')
+        self.theme_tree(self.root)
+        self.render_settings()
+        if persist:
+            try:
+                save_theme(mode)
+                self.status.set(f'{mode.title()} mode saved')
+            except Exception as exc:
+                self.status.set('Theme applied; preference could not be saved: ' + str(exc))
+
+    def set_accent_palette(self, name):
+        palette = ACCENTS.get(name, ACCENTS['green'])
+        self.accent = name if name in ACCENTS else 'green'
+        self.lime, self.accent_ink = palette['accent'], palette['ink']
+        self.side_bg, self.side_soft = palette['side'], palette['side_soft']
+        self.side_text, self.side_muted = palette['side_text'], palette['side_muted']
+        self.green = self.side_bg
+
+    def refresh_tints(self):
+        """Wash the accent into the current surfaces so the whole app follows it.
+
+        Deliberately small: the surface keeps almost all of its original
+        luminance and only shifts hue. Large blends turn dark surfaces into
+        mid-tones where the light body text no longer meets contrast targets.
+        """
+        dark = self.theme_mode == 'dark'
+        surface = '#101b18' if dark else '#ffffff'
+        soft = '#182722' if dark else '#f5f5ef'
+        self.tint = blend(surface, self.lime, 0.08 if dark else 0.10)
+        self.tint_soft = blend(soft, self.lime, 0.06 if dark else 0.06)
+        self.tint_line = blend(soft, self.lime, 0.16 if dark else 0.14)
+        self.heading_bg = blend('#23392e' if dark else '#eef1e9', self.lime, 0.10 if dark else 0.12)
+        self.heading_active = blend('#34503b' if dark else '#e4eadf', self.lime, 0.16 if dark else 0.18)
+
+    def apply_accent(self, name, persist=True):
+        if name not in ACCENTS:
+            return
+        if name == self.accent:
+            return
+        self.set_accent_palette(name)
+        self.draw_sidebar()
+        self.apply_theme(self.theme_mode, persist=False)
+        self.retag_settings_shell()
+        self.render()
+        if persist:
+            try:
+                save_accent(name)
+                self.status.set(f'{name.title()} accent saved')
+            except Exception as exc:
+                self.status.set('Accent applied; preference could not be saved: ' + str(exc))
+
+    def side_tag(self, widget, foreground=None):
+        roles = {'background': 'side'}
+        if foreground:
+            roles['foreground'] = foreground
+        self.accent_tagged[widget] = roles
+        return widget
+
+    def draw_sidebar(self):
+        tk = self.tk
+        for child in self.side.winfo_children():
+            child.destroy()
+        self.side.configure(bg=self.side_bg)
+        self.side_tag(self.side)
+        mark = tk.Canvas(self.side, width=47, height=47, bg=self.side_bg, highlightthickness=0)
+        mark.pack(anchor="w", padx=24, pady=(28, 12))
+        mark.create_rectangle(3, 9, 42, 44, fill=self.lime, outline="")
+        mark.create_rectangle(13, 1, 32, 10, fill=self.lime, outline="")
+        mark.create_line(15, 26, 30, 26, fill=self.side_bg, width=4)
+        self.side_tag(mark)
+        self.side_tag(tk.Label(self.side, text="pocket", font=("DejaVu Sans", 24, "bold"),
+                               bg=self.side_bg, fg="#f4f9ec"), 'sidetext').pack(anchor="w", padx=24)
+        self.side_tag(tk.Label(self.side, text=f"UNINSTALLER  /  {VERSION}", font=("DejaVu Sans", 8),
+                               bg=self.side_bg, fg=self.side_muted), 'sidemuted').pack(anchor="w", padx=26, pady=(1, 26))
+        self.nav_canvas = tk.Canvas(self.side, bg=self.side_bg, highlightthickness=0, height=200)
+        self.side_tag(self.nav_canvas)
+        self.nav = tk.Frame(self.nav_canvas, bg=self.side_bg)
+        self.side_tag(self.nav)
+        nav_item = self.nav_canvas.create_window((0, 0), window=self.nav, anchor="nw")
+        self.nav.bind("<Configure>", lambda e: self.nav_canvas.configure(scrollregion=self.nav_canvas.bbox("all")))
+        self.nav_canvas.bind("<Configure>", lambda e: self.nav_canvas.itemconfigure(nav_item, width=e.width))
+        bottom = tk.Frame(self.side, bg=self.side_bg)
+        self.side_tag(bottom)
+        bottom.pack(side="bottom", fill="x", padx=18, pady=22)
+        self.settings_button = self.button(bottom, "Settings", self.settings, dark=True)
+        self.settings_button.pack(fill="x", pady=(0, 6))
+        self.button(bottom, "Install / repair launcher", self.install, dark=True).pack(fill="x", pady=3)
+        self.button(bottom, "Backups & restore", self.backups, dark=True).pack(fill="x", pady=3)
+        self.button(bottom, "Scan notes", self.notes, dark=True).pack(fill="x", pady=3)
+        self.side_tag(tk.Label(bottom, text="Small footprint.\nMore room for what matters.", justify="left",
+                               bg=self.side_bg, fg=self.side_muted, font=("DejaVu Sans", 9)), 'sidemuted').pack(anchor="w", pady=(22, 0))
+        self.nav_canvas.pack(fill="both", expand=True, padx=14)
+        self.source_labels = {}
+        self.painted_nav = {}
+        self.draw_nav()
+
+    def settings(self, page=None):
+        if self.settings_window and self.settings_window.winfo_exists():
+            if page:
+                self.settings_page = page
+                self.render_settings()
+            self.settings_window.deiconify()
+            self.settings_window.lift()
+            self.settings_window.focus_set()
+            return
+        window = self.tk.Toplevel(self.root)
+        window.title("Settings")
+        window.geometry("760x560")
+        window.minsize(660, 480)
+        window.configure(bg=self.bg)
+        window.transient(self.root)
+        window.protocol("WM_DELETE_WINDOW", self.close_settings)
+        self.settings_window = window
+        rail = self.tk.Frame(window, bg=self.side_bg, width=190)
+        rail.pack(side="left", fill="y")
+        rail.pack_propagate(False)
+        self.side_tag(rail)
+        self.settings_rail = rail
+        self.settings_title = self.side_tag(self.tk.Label(rail, text="Settings", font=("DejaVu Sans", 20, "bold"),
+                                                          bg=self.side_bg, fg="#f4f9ec"), 'sidetext')
+        self.settings_title.pack(anchor="w", padx=22, pady=(28, 4))
+        self.settings_subtitle = self.side_tag(self.tk.Label(rail, text="Appearance and packages",
+                                                             font=("DejaVu Sans", 8), bg=self.side_bg,
+                                                             fg=self.side_muted), 'sidemuted')
+        self.settings_subtitle.pack(anchor="w", padx=24, pady=(0, 22))
+        self.settings_tabs = {}
+        for key, label in (("appearance", "Appearance"), ("packages", "Packages")):
+            tab = self.button(rail, label, lambda k=key: self.show_settings_page(k), dark=True)
+            tab.configure(anchor="w", font=("DejaVu Sans", 10, "bold"))
+            tab.pack(fill="x", padx=14, pady=3)
+            self.settings_tabs[key] = tab
+        self.close_button = self.button(rail, "Close", self.close_settings, dark=True)
+        self.close_button.pack(side="bottom", fill="x", padx=14, pady=20)
+        self.settings_content = self.tk.Frame(window, bg=self.bg)
+        self.settings_content.pack(side="left", fill="both", expand=True, padx=26, pady=22)
+        self.render_settings()
+        self.theme_tree(window)
+        self.root.after_idle(lambda: self.theme_tree(window))
+
+    def retag_settings_shell(self):
+        """Re-point the settings rail at the current accent colours."""
+        if not (self.settings_window and self.settings_window.winfo_exists()):
+            return
+        self.side_tag(self.settings_rail)
+        self.side_tag(self.settings_title, 'sidetext')
+        self.side_tag(self.settings_subtitle, 'sidemuted')
+        self.accent_tagged[self.close_button] = {'background': 'soft', 'foreground': 'sidetext',
+                                                 'activebackground': 'accent', 'activeforeground': 'ink'}
+        self.theme_tree(self.settings_window)
+
+    def show_settings_page(self, page):
+        if page not in ("appearance", "packages"):
+            return
+        self.settings_page = page
+        self.render_settings()
+
+    def close_settings(self):
+        if self.settings_window and self.settings_window.winfo_exists():
+            self.settings_window.destroy()
+        self.settings_window = None
+        self.settings_tabs = {}
+        self.settings_theme_buttons = {}
+        self.settings_accent_buttons = {}
+        self.settings_source_vars = {}
+
+    def render_settings(self):
+        if not (self.settings_window and self.settings_window.winfo_exists()):
+            return
+        for child in self.settings_content.winfo_children():
+            child.destroy()
+        self.settings_theme_buttons, self.settings_accent_buttons, self.settings_source_vars = {}, {}, {}
+        for key, tab in self.settings_tabs.items():
+            active = key == self.settings_page
+            tab.configure(text=("● " if active else "  ") + tab.cget("text").lstrip("● "),
+                          font=("DejaVu Sans", 10, "bold" if active else "normal"))
+            if active:
+                self.accent_tagged[tab] = {'background': 'accent', 'foreground': 'ink',
+                                           'activebackground': 'accent', 'activeforeground': 'ink'}
+            else:
+                self.accent_tagged[tab] = {'background': 'soft', 'foreground': 'sidetext',
+                                           'activebackground': 'accent', 'activeforeground': 'ink'}
+        if self.settings_page == "appearance":
+            self.build_appearance_page()
+        else:
+            self.build_packages_page()
+        self.theme_tree(self.settings_content)
+        # The tabs live on the rail, not in settings_content, so they need their
+        # own repaint or the active-page highlight never moves.
+        for tab in self.settings_tabs.values():
+            self.theme_tree(tab)
+
+    def build_appearance_page(self):
+        tk = self.tk
+        tk.Label(self.settings_content, text="Appearance", bg=self.bg, fg=self.ink,
+                 font=("DejaVu Sans", 18, "bold"), anchor="w").pack(fill="x")
+        tk.Label(self.settings_content, text="Theme and accent colour are separate. One does not change the other.",
+                 bg=self.bg, fg=self.muted, font=("DejaVu Sans", 9), anchor="w",
+                 wraplength=480, justify="left").pack(fill="x", pady=(2, 18))
+        tk.Label(self.settings_content, text="THEME", bg=self.bg, fg=self.muted,
+                 font=("DejaVu Sans", 8, "bold"), anchor="w").pack(fill="x", pady=(0, 6))
+        theme_row = tk.Frame(self.settings_content, bg=self.bg)
+        theme_row.pack(fill="x")
+        for key, label in (("light", "Light"), ("dark", "Dark")):
+            button = self.button(theme_row, ("● " if self.theme_mode == key else "  ") + label,
+                                 lambda k=key: self.choose_theme(k))
+            button.pack(side="left", padx=(0, 8))
+            self.settings_theme_buttons[key] = button
+        tk.Label(self.settings_content, text="ACCENT COLOUR", bg=self.bg, fg=self.muted,
+                 font=("DejaVu Sans", 8, "bold"), anchor="w").pack(fill="x", pady=(22, 6))
+        swatches = tk.Frame(self.settings_content, bg=self.bg)
+        swatches.pack(fill="x")
+        for n, (key, palette) in enumerate(ACCENTS.items()):
+            button = tk.Button(swatches, text=("● " if self.accent == key else "  ") + key.title(),
+                               command=lambda k=key: self.apply_accent(k), relief="flat", borderwidth=0,
+                               highlightthickness=2, highlightbackground=palette['side'],
+                               bg=palette['accent'], fg=palette['ink'], activebackground=palette['accent'],
+                               activeforeground=palette['ink'], font=("DejaVu Sans", 9, "bold"),
+                               padx=12, pady=8, cursor="hand2", takefocus=True)
+            # A swatch always shows its own colour in both themes.
+            self.tag_fixed(button, {'background': palette['accent'], 'foreground': palette['ink'],
+                                    'activebackground': palette['accent'], 'activeforeground': palette['ink'],
+                                    'highlightbackground': palette['side'], 'highlightcolor': palette['side']})
+            button.grid(row=n // 3, column=n % 3, sticky="ew", padx=(0, 8), pady=(0, 8))
+            self.settings_accent_buttons[key] = button
+        for column in range(3):
+            swatches.columnconfigure(column, weight=1, uniform="swatch")
+        tk.Label(self.settings_content,
+                 text="Green is the default. The accent changes the sidebar, selection and highlight colours; "
+                      "the theme controls only light and dark surfaces.",
+                 bg=self.bg, fg=self.muted, font=("DejaVu Sans", 8), anchor="w",
+                 wraplength=480, justify="left").pack(fill="x", pady=(10, 0))
+
+    def build_packages_page(self):
+        tk = self.tk
+        tk.Label(self.settings_content, text="Packages", bg=self.bg, fg=self.ink,
+                 font=("DejaVu Sans", 18, "bold"), anchor="w").pack(fill="x")
+        tk.Label(self.settings_content,
+                 text="Enable or disable package sources. Disabled sources are not scanned, listed or counted.\n"
+                      "Installed software is not changed by these switches.",
+                 bg=self.bg, fg=self.muted, font=("DejaVu Sans", 9), anchor="w",
+                 wraplength=480, justify="left").pack(fill="x", pady=(2, 14))
+        counts = {}
+        for app in self.apps:
+            counts[app.manager] = counts.get(app.manager, 0) + 1
+        listing = tk.Frame(self.settings_content, bg=self.bg)
+        listing.pack(fill="both", expand=True)
+        for n, source in enumerate(SOURCES):
+            var = tk.BooleanVar(value=source not in self.disabled_sources)
+            self.settings_source_vars[source] = var
+            row = tk.Frame(listing, bg=self.bg)
+            row.pack(fill="x", pady=1)
+            check = tk.Checkbutton(row, text=source, variable=var, onvalue=True, offvalue=False,
+                                   command=self.apply_sources, anchor="w", justify="left",
+                                   bg=self.bg, fg=self.ink, activebackground=self.bg, activeforeground=self.ink,
+                                   selectcolor="#ffffff", highlightthickness=0, borderwidth=0,
+                                   font=("DejaVu Sans", 10), padx=2, cursor="hand2", takefocus=True)
+            check.pack(side="left")
+            note = "detected" if counts.get(source) else "not installed here"
+            tk.Label(row, text=f"{counts.get(source, 0)} {note}", bg=self.bg, fg=self.muted,
+                     font=("DejaVu Sans", 8)).pack(side="right", padx=(8, 2))
+        actions = tk.Frame(self.settings_content, bg=self.bg)
+        actions.pack(fill="x", pady=(12, 0))
+        self.button(actions, "Enable all", lambda: self.set_all_sources(True)).pack(side="left")
+        self.button(actions, "Disable all", lambda: self.set_all_sources(False)).pack(side="left", padx=8)
+
+    def choose_theme(self, mode):
+        self.apply_theme(mode)
+        for key, button in self.settings_theme_buttons.items():
+            button.configure(text=("● " if key == mode else "  ") + key.title())
+        self.render_settings()
+
+    def set_all_sources(self, enabled):
+        for source, var in self.settings_source_vars.items():
+            var.set(enabled)
+        self.apply_sources()
+
+    def apply_sources(self):
+        disabled = sorted(source for source, var in self.settings_source_vars.items() if not var.get())
+        if set(disabled) == self.disabled_sources:
+            return
+        self.disabled_sources = set(disabled)
+        self.chosen = {key: app for key, app in self.chosen.items() if app.manager not in self.disabled_sources}
+        if self.source not in ("All", "Selected") and self.source in self.disabled_sources:
+            self.source = "All"
+        try:
+            save_disabled_sources(disabled)
+            self.status.set("Package sources updated: " + (", ".join(disabled) + " disabled" if disabled else "all enabled"))
+        except Exception as exc:
+            self.status.set("Sources applied; preference could not be saved: " + str(exc))
+        self.render_settings()
+        self.draw_nav()
+        self.refresh()
+
+    def sort_size(self):
+        self.order = 'smallest' if self.order == 'largest' else 'largest'
+        self.anchor = None
+        self.tree.heading('size', text='SIZE ↓' if self.order == 'largest' else 'SIZE ↑')
+        self.render()
+
+    def sort_name(self):
+        self.order = 'name'
+        self.anchor = None
+        self.tree.heading('size', text='SIZE ↕')
+        self.render()
+
+    def size_details(self):
+        app = self.visible.get(self.tree.focus())
+        lines = ['INSTALLED SIZE, EXPLAINED', '']
+        if app:
+            lines += [app.name, app.ident, f'{app.manager} / {app.scope}', '',
+                      'Size: ' + format_size(app.size_bytes),
+                      f'Raw value: {app.size_bytes:,} bytes' if app.size_bytes is not None else 'No reliable size is available.',
+                      'Basis: ' + app.size_kind, app.size_note, '']
+        lines += [
+            '≈ means package-manager metadata, which may be estimated or rounded.',
+            'Measured values use filesystem allocated blocks for the app file or installation folder.',
+            'Unknown means the value is missing, unreadable, or the bounded size scan could not finish. It never means zero.', '',
+            'The cards sum the known values in the filtered view or complete selection. Missing values are shown separately.',
+            'Totals are NOT a promise of reclaimable space. Shared files, runtimes, hardlinks across apps, compression and filesystem snapshots can change the actual total.',
+            'Separately installed dependencies and app data/caches are excluded unless the basis above says otherwise.',
+            'AppImages and selected leftover folders move to backup. Those backups continue occupying disk space until you delete them.', '',
+            'Click the SIZE header to sort largest first, then smallest first. Click APPLICATION to restore name order.',
+        ]
+        self.text_window('Installed size details', '\n'.join(lines))
 
     def draw_nav(self):
-        for w in self.nav.winfo_children():
-            w.destroy()
-        sources = ["All applications", "Selected"] + sorted({a.manager for a in self.apps})
-        for source in sources:
-            n = len(self.apps) if source == "All applications" else (len(self.chosen) if source == "Selected" else sum(a.manager == source for a in self.apps))
-            button = self.button(self.nav, f"{source}   {n}", lambda s=source: self.set_source(s), dark=True)
-            button.configure(anchor="w", font=("DejaVu Sans", 9), pady=8,
-                             bg=self.lime if source == self.source else self.green,
-                             fg=self.green if source == self.source else "#d4e1d3")
-            button.pack(fill="x", pady=2)
-            button.bind("<Button-4>", lambda e: self.nav_canvas.yview_scroll(-2, "units"))
-            button.bind("<Button-5>", lambda e: self.nav_canvas.yview_scroll(2, "units"))
+        """Update the source list in place. Rebuilding every button on each
+        selection change was the second-largest cost after full re-render."""
+        if not hasattr(self, 'nav') or not self.nav:
+            return
+        self.nav.configure(bg=self.side_bg)
+        total = sum(1 for a in self.apps if a.manager not in self.disabled_sources)
+        sources = ["All", "Selected"] + sorted(self.cache.counts)
+        counts = dict(self.cache.counts)
+        wanted = [(source,
+                   total if source == "All" else
+                   (len(self.chosen) if source == "Selected" else counts.get(source, 0)))
+                  for source in sources]
+        if list(self.source_labels) != [s for s, _ in wanted]:
+            for w in self.nav.winfo_children():
+                w.destroy()
+            self.source_labels = {}
+            self.painted_nav = {}
+            for source, _ in wanted:
+                button = self.button(self.nav, source, lambda s=source: self.set_source(s), dark=True)
+                button.configure(anchor="w", font=("DejaVu Sans", 9), pady=8)
+                button.pack(fill="x", pady=2)
+                button.bind("<Button-4>", lambda e: self.nav_canvas.yview_scroll(-2, "units"))
+                button.bind("<Button-5>", lambda e: self.nav_canvas.yview_scroll(2, "units"))
+                self.source_labels[source] = button
+        for source, n in wanted:
+            state = (n, source == self.source)
+            if self.painted_nav.get(source) == state:
+                continue
+            self.painted_nav[source] = state
+            button = self.source_labels[source]
+            active = source == self.source
+            button.configure(text=f"{source}   {n}",
+                             bg=self.lime if active else self.side_bg,
+                             fg=self.side_bg if active else self.side_text)
+            self.accent_tagged[button] = ({'background': 'accent', 'foreground': 'side',
+                                           'activebackground': 'accent', 'activeforeground': 'side'}
+                                          if active else
+                                          {'background': 'side', 'foreground': 'sidetext',
+                                           'activebackground': 'accent', 'activeforeground': 'side'})
+            self.theme_tree(button)
 
     def set_source(self, source):
+        if source in self.disabled_sources:
+            source = "All"
         self.source = source
         self.draw_nav()
+        # Show/hide Flatpak filter based on source
+        self.flatpak_frame.pack_forget()
+        if source == "Flatpak" and "Flatpak" not in self.disabled_sources:
+            self.flatpak_frame.pack(side="right", padx=(20, 0))
+            # Reset to all when switching to Flatpak
+            self.set_flatpak_type("all")
+        else:
+            # When not on Flatpak page, show all Flatpak packages
+            self.flatpak_type = "all"
+            # Update Flatpak filter button colors to match theme
+            for btn in [self.flatpak_all_btn, self.flatpak_apps_btn, self.flatpak_runtimes_btn]:
+                # Reset to default color
+                btn.configure(bg="#e7ecdf")
+                if btn in self.theme_originals:
+                    self.theme_originals[btn]['background'] = "#e7ecdf"
+                self.theme_tree(btn)
+        self.render()
+
+    def set_flatpak_type(self, pkg_type):
+        self.flatpak_type = pkg_type
+        # Update button appearance to show active filter
+        for btn, t in [(self.flatpak_all_btn, "all"), (self.flatpak_apps_btn, "apps"), (self.flatpak_runtimes_btn, "runtimes")]:
+            active = pkg_type == t
+            btn.configure(bg=self.lime if active else "#e7ecdf")
+            # Update the original color so theme_tree uses the correct base
+            if btn in self.theme_originals:
+                self.theme_originals[btn]['background'] = self.lime if active else "#e7ecdf"
+            self.accent_tagged[btn] = ({'background': 'accent', 'foreground': 'ink'}
+                                       if active else {'activebackground': 'accent', 'activeforeground': 'ink'})
+            # Re-apply theme to this button
+            self.theme_tree(btn)
         self.render()
 
     def render(self):
         focused = self.visible.get(self.tree.focus())
-        self.tree.delete(*self.tree.get_children())
         query = self.search.get().casefold()
-        self.visible = {}
-        for n, app in enumerate(self.apps):
+        rows = []
+        for app in self.cache.sorted_by(self.order):
+            if app.manager in self.disabled_sources:
+                continue
             if self.source == "Selected" and app.key not in self.chosen:
                 continue
-            if self.source not in ("Selected", "All applications", app.manager):
+            if self.source not in ("Selected", "All", app.manager):
                 continue
-            if query not in (app.name + " " + app.ident + " " + app.note).casefold():
+            if app.manager == "Flatpak" and self.flatpak_type != "all":
+                parts = app.ident.split("/")
+                pkg_type = parts[0] if parts and parts[0] in ("app", "runtime", "platform") else "app"
+                if self.flatpak_type == "apps" and pkg_type != "app":
+                    continue
+                if self.flatpak_type == "runtimes" and pkg_type == "app":
+                    continue
+            if not self.cache.matches(app, query):
                 continue
-            iid = str(n)
-            self.visible[iid] = app
-            self.tree.insert("", "end", iid=iid, values=("", app.name, app.manager, app.version, app.scope))
+            rows.append(app)
+        self.update_rows(rows, focused)
+        # The visible set changed, so the rendered selection must be recomputed.
+        self.selection_dirty = True
+        self.totals_dirty = True
+        self.paint()
+
+    def update_rows(self, rows, focused):
+        """Reuse existing tree items; only insert, update or delete what changed.
+
+        Rebuilding every item on each keystroke cost ~130 ms for a 1600-row
+        inventory. Inserting with its values already set avoids a second Tk
+        round-trip per row on the initial fill.
+        """
+        existing = self.tree.get_children()
+        wanted = [str(n) for n in range(len(rows))]
+        self.visible = {str(n): app for n, app in enumerate(rows)}
+        grew = len(existing) < len(wanted)
+        if len(existing) != len(wanted) or existing[:len(wanted)] != tuple(wanted):
+            extra = existing[len(wanted):]
+            if extra:
+                self.tree.delete(*extra)
+                for iid in extra:
+                    self.painted.pop(iid, None)
+                    self.cells.pop(iid, None)
+        # Any reused iid may now point at a different package, so drop cached
+        # paint state for rows whose package changed.
+        for iid, app in self.visible.items():
+            state = self.painted.get(iid)
+            if state and state[2] != app.key:
+                self.painted.pop(iid, None)
+                self.cells.pop(iid, None)
+            self.painted.setdefault(iid, None)
+        target = None
+        for iid, app in zip(wanted, rows):
+            values = ("", app.name, self.cache.size.get(app.key, format_size(app.size_bytes)),
+                      app.manager, app.version, app.scope)
+            if self.cells.get(iid) != values:
+                self.cells[iid] = values
+                if grew and iid not in existing:
+                    self.tree.insert("", "end", iid=iid, values=values)
+                else:
+                    self.tree.item(iid, values=values)
             if focused and focused.key == app.key:
-                self.tree.focus(iid)
+                target = iid
+        if target is not None:
+            self.tree.focus(target)
         children = self.tree.get_children()
         if not self.tree.focus() and children:
             self.tree.focus(children[0])
@@ -1056,18 +2336,39 @@ class PocketUI:
         else:
             self.empty.configure(text="No matching apps. Try another search or source.")
             self.empty.place(relx=.5, rely=.5, anchor="center")
-        self.paint()
+
+    def queue_render(self):
+        """Coalesce bursts of keystrokes into one repaint.
+
+        Uses an idle callback rather than a delay so a single change still
+        paints on the next event-loop pass.
+        """
+        if self.render_job is not None:
+            return
+        self.render_job = self.root.after_idle(self.run_render)
+
+    def run_render(self):
+        self.render_job = None
+        self.render()
 
     def paint(self):
-        selected = []
         focus = self.tree.focus()
-        for n, (iid, app) in enumerate(self.visible.items()):
-            checked = app.key in self.chosen
-            self.tree.set(iid, "check", "−" if guarded(app) else ("☑" if checked else "☐"))
-            self.tree.item(iid, tags=("protected",) if guarded(app) else (("active",) if iid == focus else (("odd",) if n % 2 else ())))
-            if checked:
-                selected.append(iid)
-        self.tree.selection_set(selected)
+        # Only two rows change on an arrow key, so repaint the old and new focus
+        # row instead of walking the whole inventory. Rows inserted by the last
+        # render have no cached state yet and are painted here.
+        pending = [iid for iid, state in self.painted.items() if state is None]
+        for iid in [self.painted_focus, focus] + pending:
+            if iid:
+                self.paint_row(iid)
+        self.painted_focus = focus
+        if self.selection_dirty:
+            self.selection_dirty = False
+            selected = [iid for iid, app in self.visible.items() if app.key in self.chosen]
+            if tuple(selected) != self.selection_state:
+                self.selection_state = tuple(selected)
+                self.tree.selection_set(selected)
+        else:
+            selected = self.selection_state
         n = len(self.chosen)
         hidden = n - len(selected)
         self.count.set(f"{n} app{'s' if n != 1 else ''} selected" if n else "No apps selected")
@@ -1075,8 +2376,35 @@ class PocketUI:
         self.remove_button.configure(state="normal" if n and not self.busy else "disabled")
         app = self.visible.get(focus)
         if app:
-            self.detail.set(("Protected · " if guarded(app) else "") + app.ident[:85])
-        self.total.set(f"{len(self.visible)} / {len(self.apps)} ITEMS")
+            self.detail.set(("Protected · " if self.cache.is_protected(app) else "") + app.ident[:48] + "  ·  " +
+                            format_size(app.size_bytes) + "  (" + app.size_kind + ")")
+        self.show_app_info(app)
+        if self.totals_dirty:
+            self.totals_dirty = False
+            enabled = sum(1 for a in self.apps if a.manager not in self.disabled_sources)
+            self.total.set(f"{len(self.visible)} / {enabled} ITEMS" +
+                           (f"  ·  {len(self.disabled_sources)} SOURCE(S) OFF" if self.disabled_sources else ""))
+            value, note = total_label(self.visible.values())
+            self.view_space.set(value)
+            self.view_note.set(note)
+            value, note = total_label(self.chosen.values())
+            self.selected_space.set(value)
+            self.selected_note.set(note if self.chosen else "Nothing selected")
+
+    def paint_row(self, iid):
+        """Repaint a single row's checkbox glyph and highlight tag."""
+        app = self.visible.get(iid)
+        if not app or iid not in self.painted:
+            return
+        checked = app.key in self.chosen
+        protected = self.cache.is_protected(app)
+        glyph = "−" if protected else ("☑" if checked else "☐")
+        tag = "protected" if protected else ""
+        state = (glyph, tag, app.key)
+        if self.painted.get(iid) != state:
+            self.painted[iid] = state
+            self.tree.set(iid, "check", glyph)
+            self.tree.item(iid, tags=(tag,) if tag else ())
 
     def click(self, event):
         iid = self.tree.identify_row(event.y)
@@ -1095,11 +2423,13 @@ class PocketUI:
 
     def toggle(self, iid):
         app = self.visible.get(iid)
-        if app and not guarded(app):
+        if app and not self.cache.is_protected(app):
             if app.key in self.chosen:
                 self.chosen.pop(app.key)
             else:
                 self.chosen[app.key] = app
+        self.selection_dirty = True
+        self.totals_dirty = True
         self.draw_nav()
 
     def select_range(self, start, end):
@@ -1107,8 +2437,10 @@ class PocketUI:
         a, b = sorted((ids.index(start), ids.index(end)))
         for iid in ids[a:b + 1]:
             app = self.visible[iid]
-            if not guarded(app):
+            if not self.cache.is_protected(app):
                 self.chosen[app.key] = app
+        self.selection_dirty = True
+        self.totals_dirty = True
         self.draw_nav()
 
     def navigate(self, key, extend=False):
@@ -1150,7 +2482,9 @@ class PocketUI:
 
     def select_visible(self):
         if not self.busy:
-            self.chosen.update({a.key: a for a in self.visible.values() if not guarded(a)})
+            self.chosen.update({a.key: a for a in self.visible.values() if not self.cache.is_protected(a)})
+            self.selection_dirty = True
+            self.totals_dirty = True
             self.draw_nav()
             self.paint()
         return "break"
@@ -1158,6 +2492,8 @@ class PocketUI:
     def clear(self):
         if not self.busy:
             self.chosen.clear()
+            self.selection_dirty = True
+            self.totals_dirty = True
             self.draw_nav()
             self.render()
         return "break"
@@ -1183,6 +2519,7 @@ class PocketUI:
         threading.Thread(target=run, daemon=True).start()
 
     def pump(self):
+        self.poll_info()
         try:
             while True:
                 callback, value, error = self.events.get_nowait()
@@ -1200,15 +2537,32 @@ class PocketUI:
         if self.busy:
             return
         self.status.set("Reading installed applications...")
-        self.work(lambda: scan_all(self.extra), self.scanned)
+        enabled = set(SOURCES) - self.disabled_sources
+        self.work(lambda: scan_all(self.extra, enabled), self.scanned)
 
     def scanned(self, data):
+        self.info_epoch += 1
+        self.info_cache.clear()
         self.apps, self.warnings = data
+        self.apps = [a for a in self.apps if a.manager not in self.disabled_sources]
+        self.rebuild_cache()
         current = {a.key: a for a in self.apps}
-        self.chosen = {k: current[k] for k in self.chosen if k in current and not guarded(current[k])}
+        self.chosen = {k: current[k] for k in self.chosen if k in current and not self.cache.is_protected(current[k])}
+        if self.source not in ("All", "Selected") and self.source not in self.cache.counts:
+            self.source = "All"
         self.draw_nav()
         self.render()
-        self.status.set(f"{len(self.apps)} installed entries · {len(self.warnings)} scan warning(s) · Ctrl+F to search")
+        off = f" · {len(self.disabled_sources)} source(s) disabled" if self.disabled_sources else ""
+        self.status.set(f"{len(self.apps)} installed entries · {len(self.warnings)} scan warning(s){off} · Ctrl+F to search")
+
+    def rebuild_cache(self):
+        """Precompute per-row strings and flags once per scan, not per repaint.
+
+        The old path re-ran the protected-component regex, rebuilt the search
+        haystack and re-formatted the size for every row on every keystroke.
+        """
+        self.cache = RowCache(self.apps)
+        self.cache.build()
 
     def text_window(self, title, text):
         window = self.tk.Toplevel(self.root)
@@ -1222,6 +2576,8 @@ class PocketUI:
         box.pack(fill="both", expand=True, padx=18, pady=18)
         box.insert("1.0", text)
         box.configure(state="disabled")
+        self.theme_tree(window)
+        self.root.after_idle(lambda: self.theme_tree(window))
         return window
 
     def review(self, purge_apt=False):
@@ -1352,6 +2708,7 @@ class PocketUI:
                     self.dialog.showinfo(TITLE, "Backup created:\n" + str(folder) + "\n\n" + "\n".join(errors))
                 self.work(run, done)
             self.button(window, "Move selected to backup", move, primary=True).pack(pady=18)
+            self.theme_tree(window)
         self.work(find, ready)
 
     def backups(self):
@@ -1394,6 +2751,7 @@ class PocketUI:
                 self.refresh()
             self.work(run, done)
         self.button(bar, "Restore selected", restore, primary=True).pack(side="right")
+        self.theme_tree(window)
 
     def install(self):
         if not self.busy:
@@ -1463,7 +2821,10 @@ def main():
         parser.error("This app is for Linux.")
     try:
         if args.list:
-            apps, warnings = scan_all()
+            recommended = load_preferences()
+            apps, warnings = scan_all(enabled=set(SOURCES) - set(recommended['disabled_sources']))
+            if recommended['disabled_sources']:
+                warnings = warnings + ["Disabled by settings: " + ", ".join(recommended['disabled_sources'])]
             print(json.dumps({"version": VERSION, "applications": [dataclasses.asdict(a) for a in apps], "warnings": warnings}, indent=2))
         elif args.install_launcher:
             install_launcher()
