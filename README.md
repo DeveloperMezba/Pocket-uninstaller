@@ -1,4 +1,4 @@
-# Pocket Uninstaller 0.2.0
+# Pocket Uninstaller 3.3
 
 A small Linux desktop uninstaller with a searchable inventory, native removal
 commands, and recoverable cleanup of selected leftover folders.
