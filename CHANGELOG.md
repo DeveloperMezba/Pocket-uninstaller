@@ -1,4 +1,4 @@
-# 0.2.0
+# 3.3
 
 - Replaced single-selection removal with a persistent checkbox queue.
 - Added batch review and grouped native removal. No per-app REMOVE typing in
